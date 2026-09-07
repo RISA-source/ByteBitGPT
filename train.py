@@ -72,6 +72,47 @@ def load_curriculum_bytes(stage="tinystories", max_docs=None):
     return b"\n\n".join(chunks)
 
 
+def load_multi_stage_bytes(stage_weights, max_docs_total=200000):
+    """
+    stage_weights: dict like {"tinystories": 0.6, "fineweb_edu": 0.4}
+    Approximates the mixture ratio via document COUNT per stage (weight *
+    max_docs_total), not exact byte-matching -- simple, transparent, and
+    good enough at this scale. Returns two dicts, each keyed by stage name:
+      train_bytes_by_stage, val_bytes_by_stage
+    Each stage keeps its OWN held-out validation split -- this is what lets
+    you track per-domain loss separately (catch forgetting/interference
+    between domains) instead of one blended number that hides it.
+    """
+    train_by_stage, val_by_stage = {}, {}
+    for stage, weight in stage_weights.items():
+        docs_for_stage = max(1, int(max_docs_total * weight))
+        print(f"[mixture] loading stage='{stage}' weight={weight} -> {docs_for_stage} docs")
+        raw = load_curriculum_bytes(stage, max_docs=docs_for_stage)
+        split = int(0.99 * len(raw))
+        train_by_stage[stage] = raw[:split]
+        val_by_stage[stage] = raw[split:]
+        print(f"[mixture] stage='{stage}': {len(raw)/1e6:.2f}MB total, "
+              f"{len(train_by_stage[stage])/1e6:.2f}MB train / "
+              f"{len(val_by_stage[stage])/1e6:.2f}MB val")
+    return train_by_stage, val_by_stage
+
+
+def parse_stage_weights(stages_arg):
+    """'tinystories:0.6,fineweb_edu:0.4' -> {'tinystories': 0.6, 'fineweb_edu': 0.4}
+    normalized to sum to 1.0. A bare 'tinystories' (no weight) is treated as
+    weight 1.0 -- old single-stage runs still work with --stages tinystories."""
+    result = {}
+    for part in stages_arg.split(","):
+        part = part.strip()
+        if ":" in part:
+            name, w = part.split(":")
+            result[name.strip()] = float(w)
+        else:
+            result[part] = 1.0
+    total = sum(result.values())
+    return {k: v / total for k, v in result.items()}
+
+
 class ByteDataset(Dataset):
     def __init__(self, data_bytes, block_size):
         self.data = torch.frombuffer(bytearray(data_bytes), dtype=torch.uint8).long()
@@ -104,18 +145,29 @@ def train(args):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"device: {device}")
 
-    print(f"loading stage: {args.stage}")
-    raw = load_curriculum_bytes(args.stage, max_docs=args.max_docs)
-    print(f"total training bytes: {len(raw)/1e6:.2f}MB")
+    stage_weights = parse_stage_weights(args.stages)
+    print(f"stage mixture: {stage_weights}")
+    train_by_stage, val_by_stage = load_multi_stage_bytes(stage_weights, args.max_docs)
 
-    split = int(0.99 * len(raw))
-    train_bytes, val_bytes = raw[:split], raw[split:]
+    # Combined training buffer: simple concatenation across stages. Random
+    # windowing in ByteDataset means this behaves like a shuffled mixture
+    # already -- no separate shuffle step needed.
+    train_bytes = b"".join(train_by_stage.values())
+    print(f"combined training bytes: {len(train_bytes)/1e6:.2f}MB across "
+          f"{len(train_by_stage)} stage(s)")
+
     train_ds = ByteDataset(train_bytes, args.block_size)
-    val_ds = ByteDataset(val_bytes, args.block_size)
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
                                num_workers=2, drop_last=True)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                             num_workers=2, drop_last=True)
+
+    # One SEPARATE validation loader per stage -- this is what lets you see
+    # "did it get worse on tinystories while learning fineweb_edu" instead
+    # of a single blended number that would hide that.
+    val_loaders = {}
+    for stage, vbytes in val_by_stage.items():
+        vds = ByteDataset(vbytes, args.block_size)
+        val_loaders[stage] = DataLoader(vds, batch_size=args.batch_size, shuffle=False,
+                                         num_workers=2, drop_last=True)
 
     model = ByteBitGPT(
         d_model=args.d_model, n_layer=args.n_layer, n_head=args.n_head,
@@ -128,13 +180,21 @@ def train(args):
 
     ckpt_dir = args.ckpt_dir
     os.makedirs(ckpt_dir, exist_ok=True)
-    run_name = f"{args.mode}_L{args.n_layer}_D{args.d_model}_{args.stage}"
+    if len(stage_weights) == 1:
+        # Single-stage run: keep the OLD naming convention unchanged, so
+        # --resume/--init_from still find checkpoints from before this
+        # multi-stage feature existed (e.g. your existing tinystories runs).
+        stage_tag = next(iter(stage_weights))
+    else:
+        stage_tag = "+".join(f"{k}{int(v*100)}" for k, v in stage_weights.items())
+    run_name = f"{args.mode}_L{args.n_layer}_D{args.d_model}_{stage_tag}"
     latest_path = os.path.join(ckpt_dir, f"{run_name}_latest.pt")
     best_path = os.path.join(ckpt_dir, f"{run_name}_best.pt")
     log_path = os.path.join(ckpt_dir, f"{run_name}.log.csv")
 
     start_step = 0
     best_val = float("inf")
+    log_header = "step,train_loss," + ",".join(f"val_loss_{s}" for s in val_loaders) + ",val_loss_avg,lr,elapsed_s\n"
     if os.path.exists(latest_path) and args.resume:
         print(f"resuming from {latest_path}")
         state = torch.load(latest_path, map_location=device)
@@ -149,10 +209,10 @@ def train(args):
         state = torch.load(args.init_from, map_location=device)
         model.load_state_dict(state["model"])
         with open(log_path, "w") as f:
-            f.write("step,train_loss,val_loss,lr,elapsed_s\n")
+            f.write(log_header)
     else:
         with open(log_path, "w") as f:
-            f.write("step,train_loss,val_loss,lr,elapsed_s\n")
+            f.write(log_header)
 
     data_iter = iter(train_loader)
     t0 = time.time()
@@ -180,26 +240,34 @@ def train(args):
         scaler.update()
 
         if step % args.eval_every == 0 or step == args.steps - 1:
-            val_loss = evaluate(model, val_loader, device, n_batches=20)
+            per_stage_val = {s: evaluate(model, loader, device, n_batches=20)
+                              for s, loader in val_loaders.items()}
+            val_avg = sum(per_stage_val.values()) / len(per_stage_val)
             elapsed = time.time() - t0
+            val_str = " ".join(f"val_{s} {v:.4f}" for s, v in per_stage_val.items())
             print(f"step {step:6d} | train_loss {loss.item():.4f} | "
-                  f"val_loss {val_loss:.4f} | lr {lr:.2e} | {elapsed:.0f}s")
+                  f"{val_str} | val_avg {val_avg:.4f} | lr {lr:.2e} | {elapsed:.0f}s")
             with open(log_path, "a") as f:
-                f.write(f"{step},{loss.item():.4f},{val_loss:.4f},{lr:.6f},{elapsed:.1f}\n")
+                vals_csv = ",".join(f"{per_stage_val[s]:.4f}" for s in val_loaders)
+                f.write(f"{step},{loss.item():.4f},{vals_csv},{val_avg:.4f},{lr:.6f},{elapsed:.1f}\n")
 
             ckpt = {"model": model.state_dict(), "opt": opt.state_dict(),
-                    "step": step, "best_val": best_val, "args": vars(args)}
+                    "step": step, "best_val": best_val,
+                    "per_stage_val": per_stage_val, "args": vars(args)}
 
             # Always overwrite "latest" -- this is what --resume loads.
             torch.save(ckpt, latest_path)
 
-            # Keep a separate "best" checkpoint so a late-training overfit
-            # or a bad run doesn't cost you your best result.
-            if val_loss < best_val:
-                best_val = val_loss
+            # "best" is judged on the AVERAGE across stages (equally
+            # weighted regardless of mixture ratio, so a stage with a
+            # small weight can't be silently ignored when picking the
+            # best checkpoint). Per-stage numbers are always printed and
+            # saved alongside it, so nothing is hidden.
+            if val_avg < best_val:
+                best_val = val_avg
                 ckpt["best_val"] = best_val
                 torch.save(ckpt, best_path)
-                print(f"  -> new best val_loss {best_val:.4f}, saved to {best_path}")
+                print(f"  -> new best val_avg {best_val:.4f}, saved to {best_path}")
 
             # Periodic dated snapshot so you can later compare the model's
             # behavior at different points in training, not just the end.
@@ -244,8 +312,10 @@ def sample_generation(model, device, prompt="Once upon a time"):
 def build_argparser():
     p = argparse.ArgumentParser()
     p.add_argument("--mode", choices=["fp", "ternary", "binary"], default="ternary")
-    p.add_argument("--stage", choices=["tinystories", "fineweb_edu", "cosmopedia"],
-                    default="tinystories")
+    p.add_argument("--stages", type=str, default="tinystories",
+                    help="comma list of stage:weight, e.g. 'tinystories:0.7,fineweb_edu:0.3'. "
+                         "A bare name (e.g. 'tinystories') means weight 1.0 -- old single-stage "
+                         "commands still work unchanged.")
     p.add_argument("--max_docs", type=int, default=200000,
                     help="cap docs loaded so a single Colab session finishes; raise later")
     p.add_argument("--d_model", type=int, default=256)
