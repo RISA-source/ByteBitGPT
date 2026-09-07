@@ -142,6 +142,14 @@ def train(args):
         opt.load_state_dict(state["opt"])
         start_step = state["step"]
         best_val = state.get("best_val", float("inf"))
+    elif args.init_from:
+        print(f"initializing weights from {args.init_from} "
+              f"(fresh optimizer, fresh step count -- this is curriculum "
+              f"continuation, not a mid-run resume)")
+        state = torch.load(args.init_from, map_location=device)
+        model.load_state_dict(state["model"])
+        with open(log_path, "w") as f:
+            f.write("step,train_loss,val_loss,lr,elapsed_s\n")
     else:
         with open(log_path, "w") as f:
             f.write("step,train_loss,val_loss,lr,elapsed_s\n")
@@ -254,7 +262,12 @@ def build_argparser():
     p.add_argument("--snapshot_every", type=int, default=1000,
                     help="save a dated, non-overwritten checkpoint every N steps")
     p.add_argument("--ckpt_dir", type=str, default="/content/drive/MyDrive/bitbyte_lm_ckpts")
-    p.add_argument("--resume", action="store_true")
+    p.add_argument("--resume", action="store_true",
+                    help="continue THIS exact run (same mode/shape/stage) from its own checkpoint")
+    p.add_argument("--init_from", type=str, default=None,
+                    help="path to a checkpoint from a DIFFERENT stage/run to initialize weights "
+                         "from, keeping the model but starting a fresh optimizer and step count "
+                         "-- this is how you move a model from tinystories into fineweb_edu etc.")
     return p
 
 
