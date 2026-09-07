@@ -37,6 +37,7 @@ training durations, not an absolute truth about what the model "knows".
 import argparse
 import re
 import statistics
+import time
 from collections import Counter
 
 import torch
@@ -66,13 +67,19 @@ def bigram_plausibility(word):
 @torch.no_grad()
 def generate_corpus(model, device, n_samples=40, bytes_per_sample=300, temperature=0.9):
     texts = []
-    for _ in range(n_samples):
+    t0 = time.time()
+    for i in range(n_samples):
         # Seed with a single space so generation isn't conditioned on any
         # specific prompt content -- as close to "unconditional" as this
         # architecture allows without a true BOS token.
         idx = torch.tensor([[ord(" ")]], dtype=torch.long, device=device)
         out = model.generate(idx, max_new_bytes=bytes_per_sample, temperature=temperature, top_k=40)
         texts.append(ByteBitGPT.decode(out[0]))
+        elapsed = time.time() - t0
+        avg = elapsed / (i + 1)
+        remaining = avg * (n_samples - i - 1)
+        print(f"  sample {i+1}/{n_samples} done ({elapsed:.0f}s elapsed, "
+              f"~{remaining:.0f}s remaining)", flush=True)
     return texts
 
 
