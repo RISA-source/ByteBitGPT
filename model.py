@@ -123,13 +123,34 @@ class MLP(nn.Module):
         return self.fc2(F.gelu(self.fc1(x)))
 
 
+class MoEMLP(nn.Module):
+    """N complete MLP experts (each a full BitLinear/Linear pair, matching
+    `mode`) combined via a learned per-token softmax gate. Used for the
+    Branch-Train-MiX "mix" step: each expert starts from a DIFFERENT
+    domain-specialized branch checkpoint (not shared/random init like a
+    from-scratch MoE would), so the gate has real, already-differentiated
+    behavior to route between from step one -- this is what avoids the
+    gate-collapse-into-redundancy failure mode that a from-scratch dense
+    MoE hits (verified empirically at toy scale before building this)."""
+    def __init__(self, d_model, mode, n_experts):
+        super().__init__()
+        self.n_experts = n_experts
+        self.experts = nn.ModuleList([MLP(d_model, mode) for _ in range(n_experts)])
+        self.gate = nn.Linear(d_model, n_experts)  # always fp32, tiny, not quantized
+
+    def forward(self, x):
+        gate = F.softmax(self.gate(x), dim=-1)                       # (B,T,n_experts)
+        outs = torch.stack([e(x) for e in self.experts], dim=-1)      # (B,T,D,n_experts)
+        return (outs * gate.unsqueeze(-2)).sum(-1)
+
+
 class Block(nn.Module):
-    def __init__(self, d_model, n_head, block_size, mode):
+    def __init__(self, d_model, n_head, block_size, mode, n_experts=1):
         super().__init__()
         self.ln1 = nn.LayerNorm(d_model)
         self.attn = CausalSelfAttention(d_model, n_head, block_size, mode)
         self.ln2 = nn.LayerNorm(d_model)
-        self.mlp = MLP(d_model, mode)
+        self.mlp = MLP(d_model, mode) if n_experts == 1 else MoEMLP(d_model, mode, n_experts)
 
     def forward(self, x):
         x = x + self.attn(self.ln1(x))
@@ -144,14 +165,16 @@ class Block(nn.Module):
 class ByteBitGPT(nn.Module):
     VOCAB_SIZE = 256  # every possible byte value -- this IS the vocabulary
 
-    def __init__(self, d_model=256, n_layer=12, n_head=8, block_size=512, mode="ternary"):
+    def __init__(self, d_model=256, n_layer=12, n_head=8, block_size=512, mode="ternary",
+                 n_experts=1):
         super().__init__()
         self.block_size = block_size
         self.mode = mode
+        self.n_experts = n_experts
         self.tok_emb = nn.Embedding(self.VOCAB_SIZE, d_model)
         self.pos_emb = nn.Embedding(block_size, d_model)
         self.blocks = nn.ModuleList(
-            [Block(d_model, n_head, block_size, mode) for _ in range(n_layer)]
+            [Block(d_model, n_head, block_size, mode, n_experts=n_experts) for _ in range(n_layer)]
         )
         self.ln_f = nn.LayerNorm(d_model)
         # Keep the output head full precision -- standard practice, this is
@@ -159,8 +182,9 @@ class ByteBitGPT(nn.Module):
         self.head = nn.Linear(d_model, self.VOCAB_SIZE, bias=False)
 
         n_params = sum(p.numel() for p in self.parameters())
+        experts_str = f" n_experts={n_experts}" if n_experts > 1 else ""
         print(f"[ByteBitGPT] mode={mode} layers={n_layer} d_model={d_model} "
-              f"heads={n_head} params={n_params/1e6:.2f}M")
+              f"heads={n_head} params={n_params/1e6:.2f}M{experts_str}")
 
     def forward(self, idx, targets=None):
         B, T = idx.shape

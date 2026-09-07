@@ -72,7 +72,31 @@ def load_curriculum_bytes(stage="tinystories", max_docs=None):
     return b"\n\n".join(chunks)
 
 
-def load_multi_stage_bytes(stage_weights, max_docs_total=200000):
+def load_curriculum_bytes_cached(stage, max_docs, cache_dir=None):
+    """Same as load_curriculum_bytes, but checks a cache file first (keyed
+    by stage + doc count) and writes one after downloading. This matters a
+    lot in practice: without it, every --resume or retry re-streams the
+    entire dataset from HuggingFace from scratch, which for large max_docs
+    can be most of your session's wall-clock time before training even
+    starts. Cache lives in cache_dir (point this at Drive so it survives
+    disconnects too, not just re-runs within a session)."""
+    if cache_dir:
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, f"{stage}_{max_docs}.bin")
+        if os.path.exists(cache_path):
+            print(f"[cache] found cached data for stage='{stage}' max_docs={max_docs}: "
+                  f"{cache_path} -- skipping re-download")
+            with open(cache_path, "rb") as f:
+                return f.read()
+    raw = load_curriculum_bytes(stage, max_docs=max_docs)
+    if cache_dir:
+        with open(cache_path, "wb") as f:
+            f.write(raw)
+        print(f"[cache] saved {len(raw)/1e6:.1f}MB to {cache_path} for future runs")
+    return raw
+
+
+def load_multi_stage_bytes(stage_weights, max_docs_total=200000, cache_dir=None):
     """
     stage_weights: dict like {"tinystories": 0.6, "fineweb_edu": 0.4}
     Approximates the mixture ratio via document COUNT per stage (weight *
@@ -87,7 +111,7 @@ def load_multi_stage_bytes(stage_weights, max_docs_total=200000):
     for stage, weight in stage_weights.items():
         docs_for_stage = max(1, int(max_docs_total * weight))
         print(f"[mixture] loading stage='{stage}' weight={weight} -> {docs_for_stage} docs")
-        raw = load_curriculum_bytes(stage, max_docs=docs_for_stage)
+        raw = load_curriculum_bytes_cached(stage, docs_for_stage, cache_dir=cache_dir)
         split = int(0.99 * len(raw))
         train_by_stage[stage] = raw[:split]
         val_by_stage[stage] = raw[split:]
@@ -147,7 +171,8 @@ def train(args):
 
     stage_weights = parse_stage_weights(args.stages)
     print(f"stage mixture: {stage_weights}")
-    train_by_stage, val_by_stage = load_multi_stage_bytes(stage_weights, args.max_docs)
+    train_by_stage, val_by_stage = load_multi_stage_bytes(
+        stage_weights, args.max_docs, cache_dir=args.data_cache_dir)
 
     # Combined training buffer: simple concatenation across stages. Random
     # windowing in ByteDataset means this behaves like a shuffled mixture
@@ -332,6 +357,11 @@ def build_argparser():
     p.add_argument("--snapshot_every", type=int, default=1000,
                     help="save a dated, non-overwritten checkpoint every N steps")
     p.add_argument("--ckpt_dir", type=str, default="/content/drive/MyDrive/bitbyte_lm_ckpts")
+    p.add_argument("--data_cache_dir", type=str,
+                    default="/content/drive/MyDrive/bitbyte_lm_ckpts/data_cache",
+                    help="cache downloaded stage data here (on Drive, survives sessions) "
+                         "so --resume and repeated runs don't re-download from HuggingFace "
+                         "every time. Pass '' to disable caching.")
     p.add_argument("--resume", action="store_true",
                     help="continue THIS exact run (same mode/shape/stage) from its own checkpoint")
     p.add_argument("--init_from", type=str, default=None,
